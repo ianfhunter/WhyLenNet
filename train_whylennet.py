@@ -2,8 +2,9 @@
 """Self-contained training harness for the experimental WhyLeNet architecture.
 
 WhyLeNet is intentionally strange: each macro hidden unit is a "WhyNeuron" that
-turns a 10-way activation distribution into a blended MNIST-like image, then asks
-small internal LeNets to predict the tens and ones digits of a continuous scalar.
+turns a 10-way activation distribution into a blended MNIST-like image, asks five
+small internal LeNet-1 style networks to predict each decimal place of a continuous
+scalar, re-synthesizes five digit images for the next stage, and emits the scalar.
 The script trains the full model end-to-end on MNIST without argmax/rounding in
 any forward pass path.
 """
@@ -20,6 +21,26 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+
+# Decimal place weights described in README: 100s, 10s, 1s, 0.1s, 0.01s.
+POSITION_WEIGHTS: Tuple[float, ...] = (100.0, 10.0, 1.0, 0.1, 0.01)
+
+
+def digit_to_image_differentiable(prob_distribution: Tensor, digit_bank: Tensor) -> Tensor:
+    """Blend digit templates into a single handwritten-looking image.
+
+    Input shape: [batch, 10]
+    Output shape: [batch, 1, 28, 28]
+    """
+    return torch.einsum("bi,ichw->bchw", prob_distribution, digit_bank)
+
+
+def get_unit(unit_scalar: Tensor, position_weight: float, digits: Tensor) -> Tensor:
+    """Differentiable unit extraction for one decimal place of ``unit_scalar``."""
+    shifted = (unit_scalar / position_weight).reshape(-1)
+    remainder = shifted - 10.0 * torch.floor(shifted / 10.0)
+    distances = torch.abs(remainder.unsqueeze(-1) - digits.to(unit_scalar.device))
+    return torch.softmax(-distances * 10.0, dim=-1)
 
 
 @dataclass
@@ -79,9 +100,9 @@ class DigitBank(nn.Module):
 
 
 class MiniLeNetRegressor(nn.Module):
-    """Tiny LeNet-style image-to-10-logit module used inside each WhyNeuron."""
+    """LeNet-1 style image-to-10-logit module used inside each WhyNeuron partial."""
 
-    def __init__(self, c1: int = 2, c2: int = 4) -> None:
+    def __init__(self, c1: int = 4, c2: int = 8, hidden: int = 8) -> None:
         super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(1, c1, kernel_size=5),  # 28 -> 24
@@ -93,9 +114,9 @@ class MiniLeNetRegressor(nn.Module):
         )
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(c2 * 4 * 4, 16),
+            nn.Linear(c2 * 4 * 4, hidden),
             nn.Tanh(),
-            nn.Linear(16, 10),
+            nn.Linear(hidden, 10),
         )
 
     def forward(self, x: Tensor) -> Tensor:
@@ -103,68 +124,101 @@ class MiniLeNetRegressor(nn.Module):
 
 
 class WhyNeuron(nn.Module):
-    """Base-10 super-neuron that synthesizes an image and emits one scalar.
+    """Base-10 super-neuron with five internal LeNets and image re-synthesis.
 
     Input: [batch, 10] activation logits or probabilities.
-    Output: [batch, 1] continuous value in approximately [0, 99].
+    Output: ([batch, 5, 28, 28] re-synthesized digit images, [batch, 1] scalar N).
     """
 
     def __init__(self, digit_bank: DigitBank) -> None:
         super().__init__()
         self.digit_bank = digit_bank
+        self.hundreds = MiniLeNetRegressor()
         self.tens = MiniLeNetRegressor()
         self.ones = MiniLeNetRegressor()
+        self.tenths = MiniLeNetRegressor()
+        self.hundredths = MiniLeNetRegressor()
+        self.partials = nn.ModuleList(
+            [self.hundreds, self.tens, self.ones, self.tenths, self.hundredths]
+        )
         self.register_buffer("digit_values", torch.arange(10, dtype=torch.float32), persistent=False)
 
-    def forward(self, x: Tensor, collect_stats: bool = False) -> Tensor | Tuple[Tensor, EntropyStats]:
+    def _partial_output(self, partial: MiniLeNetRegressor, blended: Tensor) -> Tensor:
+        logits = partial(blended)
+        probs = F.softmax(logits, dim=-1)
+        return (probs * self.digit_values).sum(dim=-1, keepdim=True)
+
+    def forward(
+        self, x: Tensor, collect_stats: bool = False
+    ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, EntropyStats]:
         weights = F.softmax(x, dim=-1)
-        blended = torch.einsum("bi,ichw->bchw", weights, self.digit_bank.templates)
+        blended = digit_to_image_differentiable(weights, self.digit_bank.templates)
 
-        tens_logits = self.tens(blended)
-        ones_logits = self.ones(blended)
-        tens_probs = F.softmax(tens_logits, dim=-1)
-        ones_probs = F.softmax(ones_logits, dim=-1)
+        partial_values = [self._partial_output(partial, blended) for partial in self.partials]
+        hundreds, tens, ones, tenths, hundredths = partial_values
+        scalar = (
+            100.0 * hundreds
+            + 10.0 * tens
+            + ones
+            + 0.1 * tenths
+            + 0.01 * hundredths
+        )
+        n = scalar.clamp(min=0.0, max=999.99)
 
-        tens_expected = (tens_probs * self.digit_values).sum(dim=-1, keepdim=True)
-        ones_expected = (ones_probs * self.digit_values).sum(dim=-1, keepdim=True)
-        output = 10.0 * tens_expected + ones_expected
+        unit_distributions = [
+            get_unit(n, weight, self.digit_values) for weight in POSITION_WEIGHTS
+        ]
+        resynthesized = [
+            digit_to_image_differentiable(dist, self.digit_bank.templates)
+            for dist in unit_distributions
+        ]
+        output_images = torch.cat(resynthesized, dim=1)
 
         if not collect_stats:
-            return output
+            return output_images, n
 
         stats = EntropyStats()
-        for probs in (tens_probs, ones_probs):
+        for partial in self.partials:
+            probs = F.softmax(partial(blended), dim=-1)
             entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1)
             certainty = probs.max(dim=-1).values
             stats.update(entropy, certainty)
-        return output, stats
+        return output_images, n, stats
 
 
 class WhyLinearLayer(nn.Module):
     """Linear-like layer backed by a ModuleList of WhyNeurons.
 
-    Each output neuron receives the same 10-way distribution and emits one scalar,
-    producing [batch, out_features].
+    Each output neuron receives the same 10-way distribution, emits one scalar,
+    and re-synthesizes five digit images, producing [batch, out_features] scalars
+    and [batch, out_features * 5, 28, 28] images.
     """
 
     def __init__(self, out_features: int, digit_bank: DigitBank) -> None:
         super().__init__()
         self.neurons = nn.ModuleList([WhyNeuron(digit_bank) for _ in range(out_features)])
 
-    def forward(self, x: Tensor, collect_stats: bool = False) -> Tensor | Tuple[Tensor, EntropyStats]:
-        outputs: List[Tensor] = []
+    def forward(
+        self, x: Tensor, collect_stats: bool = False
+    ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, EntropyStats]:
+        scalar_outputs: List[Tensor] = []
+        image_outputs: List[Tensor] = []
         merged_stats = EntropyStats()
+
         for neuron in self.neurons:
             if collect_stats:
-                value, stats = neuron(x, collect_stats=True)
+                images, value, stats = neuron(x, collect_stats=True)
                 merged_stats.entropy_sum += stats.entropy_sum
                 merged_stats.certainty_sum += stats.certainty_sum
                 merged_stats.count += stats.count
             else:
-                value = neuron(x)
-            outputs.append(value)
-        stacked = torch.cat(outputs, dim=1)
-        return (stacked, merged_stats) if collect_stats else stacked
+                images, value = neuron(x)
+            image_outputs.append(images)
+            scalar_outputs.append(value)
+
+        stacked_scalars = torch.cat(scalar_outputs, dim=1)
+        stacked_images = torch.cat(image_outputs, dim=1)
+        return (stacked_images, stacked_scalars, merged_stats) if collect_stats else (stacked_images, stacked_scalars)
 
 
 class WhyLeNet(nn.Module):
@@ -188,12 +242,14 @@ class WhyLeNet(nn.Module):
             nn.Linear(hidden_neurons, 10),
         )
 
-    def forward(self, x: Tensor, collect_stats: bool = False) -> Tensor | Tuple[Tensor, EntropyStats]:
+    def forward(
+        self, x: Tensor, collect_stats: bool = False
+    ) -> Tensor | Tuple[Tensor, EntropyStats]:
         distribution_logits = self.encoder(x)
         if collect_stats:
-            why_values, stats = self.why(distribution_logits, collect_stats=True)
+            _resynthesized, why_values, stats = self.why(distribution_logits, collect_stats=True)
             return self.classifier(why_values), stats
-        why_values = self.why(distribution_logits)
+        _resynthesized, why_values = self.why(distribution_logits)
         return self.classifier(why_values)
 
 
