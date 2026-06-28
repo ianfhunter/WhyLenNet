@@ -2,6 +2,8 @@
 
 "While(){Lenet}"
 
+## Overview
+
 In which we put LeNets inside our LeNet. Every Neuron is a LeNet.
 
 Of course, this poses some problems: 
@@ -22,3 +24,27 @@ So we actually need to add **more** lenets. One for each unit. (100s, 10s, 1s, 0
 
 Future research could look at 8bit variants which would reduce our LeNets by 2.
 
+## Structure
+
+For each neuron, we replace with: 
+
+```
+def WhyLeNetNeuronPartial(value):
+   value = digitToImage(value)
+   v = conv2d(value)
+   v = maxpool(value)
+   # etc
+   # v = softmax(v) not required 
+   return max_idx(v)
+
+
+def WhyLenNetNeuron(v,w,x,y,z): 
+   a = WhyLeNetNeuronPartial("Hundreds")
+   b = WhyLeNetNeuronPartial("Tens")
+   c = WhyLeNetNeuronPartial("Ones")
+   d = WhyLeNetNeuronPartial("Tenths")
+   e = WhyLeNetNeuronPartial("Hundreths")
+   N = (100 * a) + (10 * b) + (1 * c) + (0.1 * d) + (0.01 * e)
+   return N
+
+```
